@@ -40,3 +40,21 @@ Suggestions and constructive criticism are welcome!
 
 I'd particularly appreciate feedback on lightweight face-recognition models,
 photo catalog design, duplicate detection, and Smart TV compatibility.
+
+## Human + AI Collaboration
+
+This project is being developed as an experiment in human-AI collaboration.
+
+I'm using ChatGPT to help explore the architecture, evaluate technical
+options, develop the software specification, and plan the implementation.
+OpenCode will assist with writing and testing the code.
+
+I'm directing the project, making the design decisions, reviewing the
+results, and learning along the way.
+
+The goal isn't to pretend that AI can build perfect software on its own.
+It's to discover what a person working alongside AI can accomplish,
+where the tools help, and where human judgment remains essential.
+
+I'll document the process, including mistakes, discoveries, and changes
+of direction, as the project develops.
