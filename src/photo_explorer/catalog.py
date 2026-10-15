@@ -10,8 +10,20 @@ from typing import Callable, Dict, Iterator, List, NamedTuple, Optional, Union
 from . import paths
 
 
-# Bump this when the schema changes. There is no migration framework yet.
-CURRENT_SCHEMA_VERSION = 1
+# Bump this when the schema changes. Migrations are applied stepwise below;
+# there is intentionally no general migration framework yet.
+CURRENT_SCHEMA_VERSION = 2
+
+# EXIF-derived columns added in schema version 2.
+_EXIF_COLUMNS = (
+    ("capture_datetime", "TEXT"),
+    ("capture_datetime_source", "TEXT"),
+    ("exif_datetime_original", "TEXT"),
+    ("exif_datetime_digitized", "TEXT"),
+    ("exif_datetime", "TEXT"),
+    ("camera_make", "TEXT"),
+    ("camera_model", "TEXT"),
+)
 
 
 class SchemaVersionError(RuntimeError):
@@ -29,6 +41,7 @@ class IngestStats:
     updated: int = 0
     failed: int = 0
     errors: List[str] = field(default_factory=list)
+    records: List[Dict] = field(default_factory=list)
 
 
 def _get_db_path(app_root: Optional[Path] = None) -> Path:
@@ -55,7 +68,14 @@ def _create_schema(conn: sqlite3.Connection) -> None:
           ctime REAL,
           birthtime REAL,
           discovered_at REAL NOT NULL,
-          scan_id INTEGER
+          scan_id INTEGER,
+          capture_datetime TEXT,
+          capture_datetime_source TEXT,
+          exif_datetime_original TEXT,
+          exif_datetime_digitized TEXT,
+          exif_datetime TEXT,
+          camera_make TEXT,
+          camera_model TEXT
         )
         """
     )
@@ -63,14 +83,31 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext)")
 
 
+def _existing_columns(conn: sqlite3.Connection) -> set:
+    return {row["name"] for row in conn.execute("PRAGMA table_info(files)")}
+
+
+def _ensure_exif_columns(conn: sqlite3.Connection) -> None:
+    """Add any missing EXIF columns (schema v1 -> v2).
+
+    Additive and idempotent; existing rows keep their IDs and get NULL for the
+    new columns. Only called when the stored version is older than current.
+    """
+    existing = _existing_columns(conn)
+    for name, decl in _EXIF_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE files ADD COLUMN {name} {decl}")
+
+
 def init_db(
     db_path: Optional[Union[str, Path]] = None, app_root: Optional[Path] = None
 ) -> sqlite3.Connection:
     """Open (creating if needed) the catalog database.
 
-    Initializes a new database at CURRENT_SCHEMA_VERSION, keeps existing
-    current-version databases unchanged, and raises SchemaVersionError for
-    unsupported versions. The connection is closed if initialization fails.
+    Initializes a new database at CURRENT_SCHEMA_VERSION, upgrades older
+    schema versions stepwise (preserving rows and IDs), keeps current-version
+    databases unchanged, and raises SchemaVersionError for unsupported
+    versions. The connection is closed if initialization fails.
     """
     if db_path is None:
         db_path = _get_db_path(app_root)
@@ -84,14 +121,20 @@ def init_db(
         conn.execute("PRAGMA foreign_keys = ON")
 
         version = _read_user_version(conn)
-        if version not in (0, CURRENT_SCHEMA_VERSION):
+        supported = (0, 1, CURRENT_SCHEMA_VERSION)
+        if version not in supported:
             raise SchemaVersionError(
                 f"Unsupported database schema version {version}; this build "
-                f"supports version {CURRENT_SCHEMA_VERSION}."
+                f"supports versions up to {CURRENT_SCHEMA_VERSION}."
             )
 
+        # Create-if-absent, then bring older databases up to the current
+        # version. The version marker is written only after migrations succeed,
+        # so a failed migration does not mark the database as upgraded.
         _create_schema(conn)
-        if version == 0:
+        if version < CURRENT_SCHEMA_VERSION:
+            if version < 2:
+                _ensure_exif_columns(conn)
             conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
         conn.commit()
     except Exception:
@@ -121,8 +164,8 @@ def add_file(conn: sqlite3.Connection, meta: Dict) -> UpsertResult:
     """Insert or update a catalog row for a source file.
 
     Uses INSERT ... ON CONFLICT(abs_path) DO UPDATE so rescanning updates
-    filesystem metadata while preserving the existing row id. Other constraint
-    errors are allowed to propagate rather than being silently ignored.
+    filesystem and EXIF metadata while preserving the existing row id. Other
+    constraint errors are allowed to propagate rather than being ignored.
     """
     abs_path = meta.get("abs_path")
     row = conn.execute("SELECT id FROM files WHERE abs_path = ?", (abs_path,)).fetchone()
@@ -130,8 +173,12 @@ def add_file(conn: sqlite3.Connection, meta: Dict) -> UpsertResult:
 
     cur = conn.execute(
         """
-        INSERT INTO files (abs_path, folder, filename, ext, size_bytes, mtime, ctime, birthtime, discovered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO files (
+            abs_path, folder, filename, ext, size_bytes, mtime, ctime, birthtime, discovered_at,
+            capture_datetime, capture_datetime_source, exif_datetime_original,
+            exif_datetime_digitized, exif_datetime, camera_make, camera_model
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(abs_path) DO UPDATE SET
             folder = excluded.folder,
             filename = excluded.filename,
@@ -140,7 +187,14 @@ def add_file(conn: sqlite3.Connection, meta: Dict) -> UpsertResult:
             mtime = excluded.mtime,
             ctime = excluded.ctime,
             birthtime = excluded.birthtime,
-            discovered_at = excluded.discovered_at
+            discovered_at = excluded.discovered_at,
+            capture_datetime = excluded.capture_datetime,
+            capture_datetime_source = excluded.capture_datetime_source,
+            exif_datetime_original = excluded.exif_datetime_original,
+            exif_datetime_digitized = excluded.exif_datetime_digitized,
+            exif_datetime = excluded.exif_datetime,
+            camera_make = excluded.camera_make,
+            camera_model = excluded.camera_model
         """,
         (
             abs_path,
@@ -152,6 +206,13 @@ def add_file(conn: sqlite3.Connection, meta: Dict) -> UpsertResult:
             meta.get("ctime"),
             meta.get("birthtime"),
             time.time(),
+            meta.get("capture_datetime"),
+            meta.get("capture_datetime_source"),
+            meta.get("exif_datetime_original"),
+            meta.get("exif_datetime_digitized"),
+            meta.get("exif_datetime"),
+            meta.get("camera_make"),
+            meta.get("camera_model"),
         ),
     )
     conn.commit()
@@ -185,6 +246,7 @@ def ingest_files(
             stats.inserted += 1
         else:
             stats.updated += 1
+        stats.records.append(meta)
     return stats
 
 

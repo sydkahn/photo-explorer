@@ -165,3 +165,145 @@ def test_catalog_does_not_touch_source_files(tmp_path):
     assert st_after.st_mtime == st_before.st_mtime
     assert db_path.parent != src
     assert db_path.parent.name == "appdata"
+
+
+_V1_SCHEMA = """
+CREATE TABLE files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  abs_path TEXT NOT NULL UNIQUE,
+  folder TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  ext TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  mtime REAL,
+  ctime REAL,
+  birthtime REAL,
+  discovered_at REAL NOT NULL,
+  scan_id INTEGER
+)
+"""
+
+_V2_EXIF_COLUMNS = (
+    "capture_datetime",
+    "capture_datetime_source",
+    "exif_datetime_original",
+    "exif_datetime_digitized",
+    "exif_datetime",
+    "camera_make",
+    "camera_model",
+)
+
+
+def _make_v1_db(path):
+    conn = sqlite3.connect(str(path))
+    conn.execute(_V1_SCHEMA)
+    conn.execute(
+        "INSERT INTO files (abs_path, folder, filename, ext, size_bytes, mtime, discovered_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (str(path.parent / "old.jpg"), str(path.parent), "old.jpg", ".jpg", 10, 1.0, 2.0),
+    )
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+
+def test_migration_v1_to_v2_preserves_rows_and_ids(tmp_path):
+    db_path = tmp_path / "catalog.db"
+    _make_v1_db(db_path)
+
+    conn = catalog.init_db(db_path=db_path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == catalog.CURRENT_SCHEMA_VERSION
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(files)")}
+        for name in _V2_EXIF_COLUMNS:
+            assert name in columns
+
+        rows = catalog.list_files(conn)
+        assert len(rows) == 1
+        assert rows[0]["id"] == 1
+        assert rows[0]["filename"] == "old.jpg"
+        assert rows[0]["size_bytes"] == 10
+        # New EXIF fields are NULL on pre-existing rows.
+        for name in _V2_EXIF_COLUMNS:
+            assert rows[0][name] is None
+    finally:
+        catalog.close_db(conn)
+
+
+def test_migration_is_idempotent(tmp_path):
+    db_path = tmp_path / "catalog.db"
+    _make_v1_db(db_path)
+
+    first = catalog.init_db(db_path=db_path)
+    try:
+        assert first.execute("PRAGMA user_version").fetchone()[0] == catalog.CURRENT_SCHEMA_VERSION
+    finally:
+        catalog.close_db(first)
+
+    second = catalog.init_db(db_path=db_path)
+    try:
+        assert second.execute("PRAGMA user_version").fetchone()[0] == catalog.CURRENT_SCHEMA_VERSION
+        assert len(catalog.list_files(second)) == 1
+    finally:
+        catalog.close_db(second)
+
+
+def test_exif_fields_stored_and_retrieved(tmp_path):
+    db_path = tmp_path / "catalog.db"
+    f = tmp_path / "a.jpg"
+    f.write_bytes(b"x")
+    meta = scanner.get_file_metadata(f)
+    meta.update(
+        {
+            "capture_datetime": "2021-07-04T12:34:56",
+            "capture_datetime_source": "exif:DateTimeOriginal",
+            "exif_datetime_original": "2021:07:04 12:34:56",
+            "exif_datetime_digitized": None,
+            "exif_datetime": None,
+            "camera_make": "Canon",
+            "camera_model": "EOS 5D",
+        }
+    )
+    with catalog.connect(db_path=db_path) as conn:
+        catalog.add_file(conn, meta)
+        rows = catalog.list_files(conn)
+        assert len(rows) == 1
+        assert rows[0]["capture_datetime"] == "2021-07-04T12:34:56"
+        assert rows[0]["capture_datetime_source"] == "exif:DateTimeOriginal"
+        assert rows[0]["exif_datetime_original"] == "2021:07:04 12:34:56"
+        assert rows[0]["camera_make"] == "Canon"
+        assert rows[0]["camera_model"] == "EOS 5D"
+
+
+def test_rescan_updates_exif_fields_without_duplicating(tmp_path):
+    db_path = tmp_path / "catalog.db"
+    f = tmp_path / "a.jpg"
+    f.write_bytes(b"x")
+    base = scanner.get_file_metadata(f)
+
+    first = dict(base)
+    first.update(
+        {
+            "capture_datetime": "2000-01-01T00:00:00",
+            "capture_datetime_source": "exif:DateTime",
+            "camera_make": "OldMake",
+        }
+    )
+    second = dict(base)
+    second.update(
+        {
+            "capture_datetime": "2021-07-04T12:34:56",
+            "capture_datetime_source": "exif:DateTimeOriginal",
+            "camera_make": "NewMake",
+        }
+    )
+
+    with catalog.connect(db_path=db_path) as conn:
+        r1 = catalog.add_file(conn, first)
+        r2 = catalog.add_file(conn, second)
+        assert r2.file_id == r1.file_id
+        rows = catalog.list_files(conn)
+        assert len(rows) == 1
+        assert rows[0]["capture_datetime"] == "2021-07-04T12:34:56"
+        assert rows[0]["capture_datetime_source"] == "exif:DateTimeOriginal"
+        assert rows[0]["camera_make"] == "NewMake"

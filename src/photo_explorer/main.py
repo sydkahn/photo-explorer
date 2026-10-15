@@ -15,11 +15,18 @@ from PySide6.QtWidgets import (
 )
 
 from photo_explorer import __version__
-from photo_explorer import scanner, catalog
+from photo_explorer import scanner, catalog, metadata
 
 
 MAX_DISPLAYED = 1000
 MAX_REPORTED_PROBLEMS = 10
+
+
+def _catalog_metadata(path):
+    """Combine filesystem metadata with EXIF metadata for one source file."""
+    data = scanner.get_file_metadata(path)
+    data.update(metadata.extract_exif(path))
+    return data
 
 
 class MainWindow(QMainWindow):
@@ -80,19 +87,23 @@ class MainWindow(QMainWindow):
         stats = None
         try:
             with catalog.connect() as conn:
-                stats = catalog.ingest_files(conn, outcome.files, scanner.get_file_metadata)
+                stats = catalog.ingest_files(conn, outcome.files, _catalog_metadata)
         except (sqlite3.Error, catalog.SchemaVersionError, OSError) as e:
             self.list_widget.clear()
             self.count_label.setText("Cataloging failed; see error dialog")
             QMessageBox.critical(self, "Scan Error", f"Cataloging failed: {e}")
             return
 
-        # Show discovered files
+        # Show cataloged files with their capture date when available.
         self.list_widget.clear()
-        for img in outcome.files[:MAX_DISPLAYED]:
-            self.list_widget.addItem(str(img))
-        if len(outcome.files) > MAX_DISPLAYED:
-            self.list_widget.addItem(f"... and {len(outcome.files) - MAX_DISPLAYED} more")
+        for rec in stats.records[:MAX_DISPLAYED]:
+            captured = rec.get("capture_datetime")
+            label = rec.get("abs_path", "")
+            if captured:
+                label = f"{label}  [{captured}]"
+            self.list_widget.addItem(label)
+        if len(stats.records) > MAX_DISPLAYED:
+            self.list_widget.addItem(f"... and {len(stats.records) - MAX_DISPLAYED} more")
 
         cataloged = stats.inserted + stats.updated
         self.count_label.setText(
